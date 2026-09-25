@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""服务入口：``uv run fastapi dev main.py`` 或 ``uv run uvicorn main:app``。"""
 
-app = FastAPI()
+from app.service import create_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()
