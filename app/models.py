@@ -21,6 +21,23 @@ class RejectReason(str, Enum):
     BUSY = "BUSY"
     #: 事件字段非法（缺 id、时间为负等）
     INVALID = "INVALID"
+    #: 状态落盘暂时失败（已回滚内存变更，稍后重试可能成功）
+    STORE_UNAVAILABLE = "STORE_UNAVAILABLE"
+
+
+#: 暂时性（可重试）拒绝原因：过一会儿重发很可能成功
+RETRYABLE_REASONS: frozenset[RejectReason] = frozenset(
+    {
+        RejectReason.BUFFER_FULL,
+        RejectReason.BUSY,
+        RejectReason.STORE_UNAVAILABLE,
+    }
+)
+
+
+def is_retryable(reason: RejectReason | None) -> bool:
+    """判断拒绝原因是否为暂时性（重发可能成功）。"""
+    return reason in RETRYABLE_REASONS
 
 
 @dataclass(frozen=True)
@@ -57,7 +74,35 @@ class AcceptResult:
     #: 被接受但落在当前水位线之后（迟到但仍在宽限内）
     late: bool = False
     reason: RejectReason | None = None
+    #: 拒绝是否为暂时性（可安全重试）；接受时恒为 False
+    retryable: bool = False
     closed_windows: list[WindowId] = field(default_factory=list)
+
+
+class OutcomeStatus(str, Enum):
+    """按 event_id 查询到的处理结果状态。"""
+
+    #: 已被接受并计入窗口
+    ACCEPTED = "ACCEPTED"
+    #: 已被终态拒绝（重发也不会成功）
+    REJECTED = "REJECTED"
+    #: 在可重试暂存区中，等待自动重试
+    PENDING = "PENDING"
+
+
+@dataclass(frozen=True)
+class EventOutcome:
+    """某个 event_id 的已确认处理结果（用于按标识查询）。"""
+
+    event_id: str
+    status: OutcomeStatus
+    watermark_ms: int
+    late: bool = False
+    reason: RejectReason | None = None
+
+    @property
+    def retryable(self) -> bool:
+        return self.status == OutcomeStatus.PENDING or is_retryable(self.reason)
 
 
 @dataclass(frozen=True)

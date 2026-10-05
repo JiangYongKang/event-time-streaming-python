@@ -12,21 +12,42 @@
 * 窗口关闭：当 ``W >= end + allowed_lateness_ms`` 时窗口永久关闭；关闭后
   该窗口不再接受任何事件（迟到事件被拒绝）。
 * 同一 ``event_id`` 只计一次，重复投递返回 DUPLICATE_EVENT。
+
+处理结果台账（outcome ledger）
+------------------------------
+每个被处理过的 ``event_id``（接受或终态拒绝）都会记录一条
+:class:`EventOutcome`，随状态快照一起原子持久化。客户端超时/失败后可按
+``event_id`` 查询当时的结果，放心决定重试或放弃；重启后台账依旧可查。
+
+落盘失败处理
+------------
+* 接受事件的持久化失败时，**回滚内存中的聚合与去重变更**（不出现只生效
+  一半的状态），返回 ``STORE_UNAVAILABLE``（可重试），由上层放入暂存区
+  稍后自动重试；服务本身不停摆。
+* 水位线推进的持久化失败时，内存水位线保持（单调性优先），标记为
+  “待刷盘”，后续任何一次成功写入或 :meth:`flush` 都会把完整快照落盘，
+  实现自愈。
 """
 
+import logging
 import threading
 from collections import defaultdict
+from collections.abc import Callable
 
 from app.config import Settings
 from app.models import (
     AcceptResult,
     Event,
+    EventOutcome,
+    OutcomeStatus,
     RejectReason,
     Snapshot,
     WindowAggregate,
     WindowId,
 )
 from app.storage import StateStore
+
+logger = logging.getLogger("ets.aggregator")
 
 _INITIAL_WATERMARK = -1
 
@@ -51,11 +72,20 @@ class EventTimeAggregator:
         self._seen_ids: set[str] = set()
         self._watermark_ms: int = _INITIAL_WATERMARK
         self._closed_ever: list[WindowId] = []
+        # event_id -> 已确认处理结果（接受或终态拒绝）
+        self._outcomes: dict[str, EventOutcome] = {}
+        # 暂存区内容提供者（由摄取层注册，持久化时一并快照）
+        self._retry_provider: Callable[[], list[Event]] | None = None
+        # 上次落盘是否失败（待自愈）
+        self._persist_degraded = False
+        self._loaded_retry_events: list[Event] = []
         if store is not None:
-            windows, watermark_ms, seen_ids = store.load()
-            self._windows = defaultdict(dict, windows)
-            self._seen_ids = seen_ids
-            self._watermark_ms = max(_INITIAL_WATERMARK, watermark_ms)
+            loaded = store.load()
+            self._windows = defaultdict(dict, loaded.windows)
+            self._seen_ids = loaded.seen_ids
+            self._watermark_ms = max(_INITIAL_WATERMARK, loaded.watermark_ms)
+            self._outcomes = dict(loaded.outcomes)
+            self._loaded_retry_events = list(loaded.retry_events)
 
     # ---- 内部工具 -------------------------------------------------------
 
@@ -65,17 +95,73 @@ class EventTimeAggregator:
         return WindowId(key=key, start_ms=start, end_ms=start + size)
 
     def _persist_locked(self) -> None:
-        if self._store is not None:
+        """落盘完整快照；失败时标记 degraded 并抛出，由调用方决定回滚/自愈。"""
+        if self._store is None:
+            return
+        try:
             self._store.save(
-                self._windows, self._watermark_ms, self._seen_ids
+                self._windows,
+                self._watermark_ms,
+                self._seen_ids,
+                outcomes=self._outcomes,
+                retry_events=(
+                    self._retry_provider() if self._retry_provider else []
+                ),
             )
+        except Exception:
+            if not self._persist_degraded:
+                logger.warning(
+                    "state persist failed; service keeps running on in-memory "
+                    "state and will retry on next write/flush"
+                )
+            self._persist_degraded = True
+            raise
+        if self._persist_degraded:
+            logger.info("state persist recovered; snapshot is durable again")
+        self._persist_degraded = False
+
+    # ---- 与摄取层的衔接 --------------------------------------------------
+
+    def set_retry_provider(self, provider: Callable[[], list[Event]]) -> None:
+        """注册暂存区内容回调，持久化时把待重试事件一并写入快照。"""
+        self._retry_provider = provider
+
+    def take_loaded_retry_events(self) -> list[Event]:
+        """取出重启前暂存区中未重试完的事件（只取一次）。"""
+        events, self._loaded_retry_events = self._loaded_retry_events, []
+        return events
+
+    def persist(self) -> bool:
+        """主动落盘一次完整快照（暂存区内容变化后由摄取层调用）。"""
+        with self._lock:
+            try:
+                self._persist_locked()
+            except Exception:  # noqa: BLE001 - 落盘故障必须兜底，不能拖垮摄取
+                return False
+            return True
+
+    def flush(self) -> bool:
+        """落盘自愈：若之前写入失败，重试一次完整快照。返回当前是否健康。"""
+        with self._lock:
+            if not self._persist_degraded:
+                return True
+            try:
+                self._persist_locked()
+            except Exception:  # noqa: BLE001 - 落盘故障必须兜底，不能拖垮摄取
+                return False
+            return True
+
+    @property
+    def store_healthy(self) -> bool:
+        return not self._persist_degraded
 
     # ---- 水位线 ---------------------------------------------------------
 
     def advance_watermark(self, timestamp_ms: int) -> list[WindowId]:
         """推进水位线；小于等于当前值的调用不会使其回退。
 
-        返回本次推进新关闭的窗口列表。
+        返回本次推进新关闭的窗口列表。落盘失败时水位线在内存中保持
+        （单调性优先），标记为待刷盘，后续成功写入会自愈。
         """
         with self._lock:
             if timestamp_ms <= self._watermark_ms:
@@ -83,7 +169,12 @@ class EventTimeAggregator:
                 return []
             self._watermark_ms = timestamp_ms
             closed = self.close_expired_windows()
-            self._persist_locked()
+            try:
+                self._persist_locked()
+            except Exception:  # noqa: BLE001 - 落盘故障必须兜底，不能拖垮摄取
+                # 水位线不回滚（单调性），等待后续写入自愈；
+                # _persist_locked 已记录告警
+                logger.debug("watermark persist deferred until next write")
             return closed
 
     def close_expired_windows(self) -> list[WindowId]:
@@ -102,6 +193,8 @@ class EventTimeAggregator:
     def add_event(self, event: Event) -> AcceptResult:
         invalid = validate_event(event)
         if invalid is not None:
+            with self._lock:
+                self._record_outcome_locked(event, False, invalid, False)
             return AcceptResult(
                 accepted=False,
                 watermark_ms=self._watermark_ms,
@@ -111,31 +204,40 @@ class EventTimeAggregator:
             wm = self._watermark_ms
             window = self._window_of(event.key, event.event_time_ms)
 
-            # 1) 幂等去重
+            # 1) 幂等去重（保留原始 ACCEPTED 台账，不覆盖）
             if event.event_id in self._seen_ids:
                 return AcceptResult(
                     accepted=False, watermark_ms=wm,
                     reason=RejectReason.DUPLICATE_EVENT,
                 )
 
-            # 2) 迟到判定（在宽限期之外 -> 拒绝）
+            # 2) 迟到判定（在宽限期之外 -> 终态拒绝，记录台账）
             late = event.event_time_ms < wm
             if late and event.event_time_ms < wm - self.settings.allowed_lateness_ms:
+                self._record_outcome_locked(
+                    event, False, RejectReason.LATE_EVENT, True
+                )
+                self._persist_safely_locked()
                 return AcceptResult(
                     accepted=False, watermark_ms=wm,
                     late=True, reason=RejectReason.LATE_EVENT,
                 )
 
-            # 3) 窗口已关闭 -> 拒绝（与迟到拒绝同因，结果可解释）
+            # 3) 窗口已关闭 -> 终态拒绝（与迟到拒绝同因，结果可解释）
             buckets = self._windows[event.key]
             agg = buckets.get(window.start_ms)
             if agg is not None and agg.closed:
+                self._record_outcome_locked(
+                    event, False, RejectReason.LATE_EVENT, late
+                )
+                self._persist_safely_locked()
                 return AcceptResult(
                     accepted=False, watermark_ms=wm,
                     late=late, reason=RejectReason.LATE_EVENT,
                 )
 
             # 4) 计入（聚合 + 去重集合在同一把锁内更新，避免竞态丢计数）
+            existed = agg is not None
             if agg is None:
                 agg = WindowAggregate(window=window)
                 buckets[window.start_ms] = agg
@@ -143,7 +245,25 @@ class EventTimeAggregator:
             agg.total += event.value
             agg.event_ids.add(event.event_id)
             self._seen_ids.add(event.event_id)
-            self._persist_locked()
+            self._record_outcome_locked(event, True, None, late)
+            try:
+                self._persist_locked()
+            except Exception:  # noqa: BLE001 - 落盘故障必须兜底，不能拖垮摄取
+                # 落盘失败：回滚内存变更，保证不出现“只生效一半”的状态；
+                # 返回可重试拒绝，由上层暂存稍后自动重试
+                agg.count -= 1
+                agg.total -= event.value
+                agg.event_ids.discard(event.event_id)
+                self._seen_ids.discard(event.event_id)
+                self._outcomes.pop(event.event_id, None)
+                if not existed:
+                    del buckets[window.start_ms]
+                return AcceptResult(
+                    accepted=False,
+                    watermark_ms=wm,
+                    reason=RejectReason.STORE_UNAVAILABLE,
+                    retryable=True,
+                )
 
             return AcceptResult(
                 accepted=True,
@@ -151,7 +271,37 @@ class EventTimeAggregator:
                 late=late,
             )
 
+    def _record_outcome_locked(
+        self,
+        event: Event,
+        accepted: bool,
+        reason: RejectReason | None,
+        late: bool,
+    ) -> None:
+        """记录已确认结果；同一 event_id 只记首次决定，不被后续重复覆盖。"""
+        if not event.event_id or event.event_id in self._outcomes:
+            return
+        self._outcomes[event.event_id] = EventOutcome(
+            event_id=event.event_id,
+            status=OutcomeStatus.ACCEPTED if accepted else OutcomeStatus.REJECTED,
+            watermark_ms=self._watermark_ms,
+            late=late,
+            reason=reason,
+        )
+
+    def _persist_safely_locked(self) -> None:
+        """终态拒绝台账的落盘：失败不影响拒绝语义，等待后续写入自愈。"""
+        try:
+            self._persist_locked()
+        except Exception:  # noqa: BLE001 - 落盘故障必须兜底，不能拖垮摄取
+            logger.debug("rejection-outcome persist deferred until next write")
+
     # ---- 观测 -----------------------------------------------------------
+
+    def query_event(self, event_id: str) -> EventOutcome | None:
+        """按 event_id 查询已确认的处理结果；未处理过返回 None。"""
+        with self._lock:
+            return self._outcomes.get(event_id)
 
     def snapshot(self) -> Snapshot:
         with self._lock:

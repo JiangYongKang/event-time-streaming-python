@@ -2,13 +2,13 @@
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app.aggregator import EventTimeAggregator
 from app.config import Settings, get_settings
 from app.ingest import IngestService
-from app.models import Event, RejectReason
+from app.models import Event
 from app.storage import StateStore
 
 
@@ -41,11 +41,23 @@ def _result_dto(result, closed=None) -> dict:
         "watermark_ms": result.watermark_ms,
         "late": result.late,
         "reason": result.reason.value if result.reason else None,
+        "retryable": result.retryable,
         "closed_windows": [
             {"key": w.key, "interval": w.interval(),
              "start_ms": w.start_ms, "end_ms": w.end_ms}
             for w in (closed or result.closed_windows)
         ],
+    }
+
+
+def _outcome_dto(outcome) -> dict:
+    return {
+        "event_id": outcome.event_id,
+        "status": outcome.status.value,
+        "watermark_ms": outcome.watermark_ms,
+        "late": outcome.late,
+        "reason": outcome.reason.value if outcome.reason else None,
+        "retryable": outcome.retryable,
     }
 
 
@@ -107,12 +119,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
         return {"watermark_ms": snap.watermark_ms, "windows": windows}
 
+    @app.get("/events/{event_id}")
+    def get_event_outcome(event_id: str) -> dict:
+        """按 event_id 查询处理结果，供客户端超时/失败后安全重试。
+
+        * 200 + status=ACCEPTED/REJECTED：该标识已有终态结果，不要重发；
+        * 200 + status=PENDING：在暂存区等待自动重试，稍后再查；
+        * 404：从未见过该标识，可以放心首次提交。
+        """
+        outcome = ingest.query_event(event_id)
+        if outcome is None:
+            raise HTTPException(status_code=404, detail="event_id not found")
+        return _outcome_dto(outcome)
+
     @app.get("/health")
     def health() -> dict:
         return {
             "status": "ok",
             "watermark_ms": aggregator.watermark_ms,
             "buffer_size": ingest.buffer_size(),
+            "retry_buffer_size": ingest.retry_buffer_size(),
+            "store_healthy": aggregator.store_healthy,
         }
 
     # 暴露给测试直接操作
