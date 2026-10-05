@@ -23,6 +23,17 @@ class RejectReason(str, Enum):
     INVALID = "INVALID"
 
 
+#: 暂时性失败（过一会儿重发很可能成功），可进入重试暂存区
+TRANSIENT_REASONS: frozenset[RejectReason] = frozenset(
+    {RejectReason.BUFFER_FULL, RejectReason.BUSY}
+)
+
+
+def is_transient(reason: RejectReason | None) -> bool:
+    """判断拒绝原因是否为暂时性失败（可重试）。"""
+    return reason in TRANSIENT_REASONS
+
+
 @dataclass(frozen=True)
 class Event:
     event_id: str
@@ -58,9 +69,48 @@ class AcceptResult:
     late: bool = False
     reason: RejectReason | None = None
     closed_windows: list[WindowId] = field(default_factory=list)
+    #: 本次结果为暂时性失败且已进入重试暂存区，稍后将自动重试
+    retry_scheduled: bool = False
 
 
 @dataclass(frozen=True)
 class Snapshot:
     watermark_ms: int
     windows: list[WindowAggregate]
+
+
+class DecisionStatus(str, Enum):
+    """按事件标识查询到的处理结果状态。"""
+
+    #: 已接受并计入窗口
+    ACCEPTED = "ACCEPTED"
+    #: 终态拒绝（重发也不会成功，如超宽限迟到、字段非法）
+    REJECTED = "REJECTED"
+    #: 暂时性失败，已放入重试暂存区，等待自动重试
+    PENDING = "PENDING"
+
+
+@dataclass(frozen=True)
+class EventDecision:
+    """某个 event_id 的（首个）确定性处理结果。
+
+    客户端超时/失败后可按 event_id 查询该记录，决定是否可以安全重发。
+    重复投递不会覆盖已记录的终态结果。
+    """
+
+    event_id: str
+    status: DecisionStatus
+    reason: RejectReason | None = None
+    late: bool = False
+    watermark_ms: int = -1
+
+
+@dataclass(frozen=True)
+class PendingRetry:
+    """重试暂存区中的一条记录（暂时性失败、等待自动重试的事件）。"""
+
+    event: Event
+    reason: RejectReason
+    attempts: int = 0
+    #: 单调时钟（time.monotonic）上的下次可重试时刻；持久化时不保存
+    not_before: float = 0.0

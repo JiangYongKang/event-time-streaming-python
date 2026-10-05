@@ -20,6 +20,10 @@ class Settings:
     ingest_workers: int = 2
     #: 聚合状态持久化文件路径（重启恢复用）
     state_path: str = "data/state.json"
+    #: 重试暂存区容量（暂时性失败的事件在此等待自动重试）；0 表示关闭可重试摄取
+    max_retry_events: int = 0
+    #: 自动重试节奏（毫秒）：维护线程每隔该间隔处理一批到期的暂存事件
+    retry_interval_ms: int = 200
 
 
 def _env_int(name: str, default: int) -> int:
@@ -40,4 +44,6 @@ def get_settings() -> Settings:
         max_pending_events=_env_int("ETS_MAX_PENDING_EVENTS", 1000),
         ingest_workers=_env_int("ETS_INGEST_WORKERS", 2),
         state_path=os.environ.get("ETS_STATE_PATH", "data/state.json"),
+        max_retry_events=_env_int("ETS_MAX_RETRY_EVENTS", 0),
+        retry_interval_ms=_env_int("ETS_RETRY_INTERVAL_MS", 200),
     )

@@ -9,7 +9,15 @@ import json
 import os
 import tempfile
 
-from app.models import WindowAggregate, WindowId
+from app.models import (
+    DecisionStatus,
+    Event,
+    EventDecision,
+    PendingRetry,
+    RejectReason,
+    WindowAggregate,
+    WindowId,
+)
 
 
 class StateStore:
@@ -21,10 +29,35 @@ class StateStore:
         windows: dict[str, dict[int, WindowAggregate]],
         watermark_ms: int,
         seen_ids: set[str],
+        decisions: dict[str, EventDecision] | None = None,
+        pending_retries: dict[str, PendingRetry] | None = None,
     ) -> None:
         payload = {
             "watermark_ms": watermark_ms,
             "seen_ids": sorted(seen_ids),
+            "decisions": {
+                eid: {
+                    "status": d.status.value,
+                    "reason": d.reason.value if d.reason else None,
+                    "late": d.late,
+                    "watermark_ms": d.watermark_ms,
+                }
+                for eid, d in sorted((decisions or {}).items())
+            },
+            "pending_retries": [
+                {
+                    "event_id": p.event.event_id,
+                    "key": p.event.key,
+                    "event_time_ms": p.event.event_time_ms,
+                    "value": p.event.value,
+                    "reason": p.reason.value,
+                    "attempts": p.attempts,
+                }
+                for p in sorted(
+                    (pending_retries or {}).values(),
+                    key=lambda p: p.event.event_id,
+                )
+            ],
             "windows": {
                 key: [
                     {
@@ -62,9 +95,15 @@ class StateStore:
 
     def load(
         self,
-    ) -> tuple[dict[str, dict[int, WindowAggregate]], int, set[str]]:
+    ) -> tuple[
+        dict[str, dict[int, WindowAggregate]],
+        int,
+        set[str],
+        dict[str, EventDecision],
+        dict[str, PendingRetry],
+    ]:
         if not os.path.exists(self.path):
-            return {}, -1, set()
+            return {}, -1, set(), {}, {}
         with open(self.path, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
         windows: dict[str, dict[int, WindowAggregate]] = {}
@@ -86,4 +125,30 @@ class StateStore:
             windows[key] = buckets
         seen_ids = set(payload.get("seen_ids", []))
         watermark_ms = int(payload.get("watermark_ms", -1))
-        return windows, watermark_ms, seen_ids
+
+        # 旧版本快照没有 decisions / pending_retries 字段，缺省为空（向后兼容）
+        decisions: dict[str, EventDecision] = {}
+        for eid, raw in payload.get("decisions", {}).items():
+            decisions[eid] = EventDecision(
+                event_id=eid,
+                status=DecisionStatus(raw["status"]),
+                reason=RejectReason(raw["reason"]) if raw.get("reason") else None,
+                late=bool(raw.get("late", False)),
+                watermark_ms=int(raw.get("watermark_ms", -1)),
+            )
+        pending: dict[str, PendingRetry] = {}
+        for raw in payload.get("pending_retries", []):
+            event = Event(
+                event_id=raw["event_id"],
+                key=raw["key"],
+                event_time_ms=raw["event_time_ms"],
+                value=int(raw.get("value", 1)),
+            )
+            pending[event.event_id] = PendingRetry(
+                event=event,
+                reason=RejectReason(raw["reason"]),
+                attempts=int(raw.get("attempts", 0)),
+                # 重启后立即可重试
+                not_before=0.0,
+            )
+        return windows, watermark_ms, seen_ids, decisions, pending

@@ -2,13 +2,13 @@
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app.aggregator import EventTimeAggregator
 from app.config import Settings, get_settings
 from app.ingest import IngestService
-from app.models import Event, RejectReason
+from app.models import Event
 from app.storage import StateStore
 
 
@@ -41,11 +41,22 @@ def _result_dto(result, closed=None) -> dict:
         "watermark_ms": result.watermark_ms,
         "late": result.late,
         "reason": result.reason.value if result.reason else None,
+        "retry_scheduled": result.retry_scheduled,
         "closed_windows": [
             {"key": w.key, "interval": w.interval(),
              "start_ms": w.start_ms, "end_ms": w.end_ms}
             for w in (closed or result.closed_windows)
         ],
+    }
+
+
+def _decision_dto(decision) -> dict:
+    return {
+        "event_id": decision.event_id,
+        "status": decision.status.value,
+        "reason": decision.reason.value if decision.reason else None,
+        "late": decision.late,
+        "watermark_ms": decision.watermark_ms,
     }
 
 
@@ -107,12 +118,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
         return {"watermark_ms": snap.watermark_ms, "windows": windows}
 
+    @app.get("/events/{event_id}")
+    def get_event(event_id: str) -> dict:
+        """按事件标识查询处理结果，供客户端超时/失败后安全重试前确认。"""
+        decision = aggregator.query_event(event_id)
+        if decision is None:
+            raise HTTPException(status_code=404, detail="event_id not found")
+        return _decision_dto(decision)
+
     @app.get("/health")
     def health() -> dict:
         return {
             "status": "ok",
             "watermark_ms": aggregator.watermark_ms,
             "buffer_size": ingest.buffer_size(),
+            "retry_buffer_size": ingest.retry_buffer_size(),
+            "storage_degraded": aggregator.storage_degraded,
         }
 
     # 暴露给测试直接操作
